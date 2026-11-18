@@ -965,7 +965,7 @@ static class Program {
             if (title.Length > 34) title = title.Substring(0, 34);
         }
 
-        // Collect reachable instructions (or fallback to first 220 instructions if entry flow was indirect)
+        // Collect all reachable instructions (or fallback to all instructions if entry flow was indirect)
         List<AsmInstruction> codeList = new List<AsmInstruction>();
         for (int i = 0; i < prog.Instructions.Count; i++) {
             if (prog.Instructions[i].IsReachableCode) {
@@ -973,26 +973,37 @@ static class Program {
             }
         }
         if (codeList.Count < 8) {
-            for (int i = 0; i < Math.Min(220, prog.Instructions.Count); i++) {
+            codeList.Clear();
+            for (int i = 0; i < prog.Instructions.Count; i++) {
                 codeList.Add(prog.Instructions[i]);
             }
         }
-        if (codeList.Count > 260) {
-            codeList = codeList.GetRange(0, 260);
-        }
 
-        // Map every instruction address in codeList to a deterministic BASIC line number (1000 + idx*10)
+        // Map every instruction address in codeList to a deterministic BASIC line number
+        int instrStep = (codeList.Count <= 3000) ? 10 : 1;
         Dictionary<ushort, int> addrToLine = new Dictionary<ushort, int>();
         for (int i = 0; i < codeList.Count; i++) {
-            addrToLine[codeList[i].Address] = 1000 + i * 10;
+            addrToLine[codeList[i].Address] = 1000 + i * instrStep;
         }
+        int returnLine = 1000 + codeList.Count * instrStep;
 
-        // Find base memory address for array-backed memory window M(0..255)
+        // Build full memory image spanning all loaded blocks/bytes for array-backed MM(0..NB)
         ushort memBase = prog.Blocks.Count > 0 ? prog.Blocks[0].LoadAddress : prog.ExecAddress;
         List<byte> initBytes = new List<byte>();
-        if (prog.Blocks.Count > 0) {
-            int copyCount = Math.Min(256, prog.Blocks[0].RawBytes.Count);
-            for (int i = 0; i < copyCount; i++) initBytes.Add(prog.Blocks[0].RawBytes[i]);
+        if (prog.MemoryMap.Count > 0) {
+            ushort minAddr = ushort.MaxValue;
+            ushort maxAddr = 0;
+            foreach (ushort addr in prog.MemoryMap.Keys) {
+                if (addr < minAddr) minAddr = addr;
+                if (addr > maxAddr) maxAddr = addr;
+            }
+            memBase = minAddr;
+            int totalSpan = (maxAddr - minAddr) + 1;
+            for (int i = 0; i < totalSpan; i++) {
+                initBytes.Add(prog.ReadByte(minAddr + i));
+            }
+        } else if (prog.Blocks.Count > 0) {
+            for (int i = 0; i < prog.Blocks[0].RawBytes.Count; i++) initBytes.Add(prog.Blocks[0].RawBytes[i]);
         }
         while (initBytes.Count < 64) initBytes.Add(0);
 
@@ -1020,9 +1031,10 @@ static class Program {
             prog.ExecAddress, prog.SubroutineTargets.Count, prog.RomCalls.Count);
         sb.AppendLine("40 ' Pure Super Extended Color BASIC 2.1 (No Machine Code)");
         sb.AppendLine("50 ' ============================================================");
+        int strCount = Math.Max(1, prog.ExtractedStrings.Count);
         sb.AppendLine("60 CLEAR 2000:POKE 65497,0");
-        sb.AppendFormat("70 MB={0}:NB={1}:NS={2}\r\n", (int)memBase, initBytes.Count - 1, Math.Max(1, Math.Min(20, prog.ExtractedStrings.Count)));
-        sb.AppendLine("80 DIM MM(255),ST$(20),PL(15)");
+        sb.AppendFormat("70 MB={0}:NB={1}:NS={2}\r\n", (int)memBase, initBytes.Count - 1, strCount);
+        sb.AppendFormat("80 DIM MM({0}),ST$({1}),PL(15)\r\n", initBytes.Count - 1, strCount);
         sb.AppendLine("90 GOSUB 700 ' Initialize Memory Window, Palettes, Strings & Screen");
         int startLine = addrToLine.ContainsKey(prog.ExecAddress) ? addrToLine[prog.ExecAddress] : 1000;
         sb.AppendFormat("100 GOSUB {0} ' Execute Decompiled 6809 Entry Point (${1:X4})\r\n", startLine, prog.ExecAddress);
@@ -1035,39 +1047,43 @@ static class Program {
         sb.AppendLine("530 RA=ASC(K$):IF RA>=97 AND RA<=122 THEN RA=RA-32");
         sb.AppendLine("540 FZ=(RA=0):FN=0:FC=0");
         int kdLine = 542;
-        for (int i = 0; i < Math.Min(12, prog.KeyDispatches.Count); i++) {
+        for (int i = 0; i < prog.KeyDispatches.Count; i++) {
             KeyDispatchEntry kd = prog.KeyDispatches[i];
             int tLine;
             if (addrToLine.TryGetValue(kd.TargetAddress, out tLine)) {
                 sb.AppendFormat("{0} IF RA={1} THEN GOSUB {2}:GOTO 510 ' Key ${1:X2} -> ${3:X4}\r\n",
                     kdLine, (int)kd.KeyCode, tLine, kd.TargetAddress);
-                kdLine += 2;
+                kdLine += 1;
             }
         }
-        sb.AppendLine("570 IF RA=8  OR RA=65 THEN PX=PX-8:IF PX<16 THEN PX=16");
-        sb.AppendLine("572 IF RA=9  OR RA=68 THEN PX=PX+8:IF PX>296 THEN PX=296");
-        sb.AppendLine("574 IF RA=94 OR RA=87 THEN PY=PY-8:IF PY<24 THEN PY=24");
-        sb.AppendLine("576 IF RA=10 OR RA=83 THEN PY=PY+8:IF PY>168 THEN PY=168");
-        sb.AppendLine("578 IF RA=32 THEN SC=SC+10:SOUND 180,1");
-        sb.AppendLine("580 IF RA=81 THEN RETURN ' Q = Quit");
-        sb.AppendLine("590 GOTO 510");
+        int navLine = Math.Max(570, kdLine);
+        sb.AppendFormat("{0} IF RA=8  OR RA=65 THEN PX=PX-8:IF PX<16 THEN PX=16\r\n", navLine);
+        sb.AppendFormat("{0} IF RA=9  OR RA=68 THEN PX=PX+8:IF PX>296 THEN PX=296\r\n", navLine + 2);
+        sb.AppendFormat("{0} IF RA=94 OR RA=87 THEN PY=PY-8:IF PY<24 THEN PY=24\r\n", navLine + 4);
+        sb.AppendFormat("{0} IF RA=10 OR RA=83 THEN PY=PY+8:IF PY>168 THEN PY=168\r\n", navLine + 6);
+        sb.AppendFormat("{0} IF RA=32 THEN SC=SC+10:SOUND 180,1\r\n", navLine + 8);
+        sb.AppendFormat("{0} IF RA=81 THEN RETURN ' Q = Quit\r\n", navLine + 10);
+        sb.AppendFormat("{0} GOTO 510\r\n", navLine + 12);
         sb.AppendLine("600 ' ===== RENDER PROGRAM HUD, STRINGS & GRAPHICS STATE =====");
         sb.AppendLine("610 HCLS 0:HCOLOR 1:HLINE(4,12)-(315,180),PSET,B");
         sb.AppendLine("620 HCOLOR 2:HPRINT(1,0),LEFT$(ST$(1),26)+\" SCR:\"+STR$(SC)");
-        for (int i = 0; i < Math.Min(6, prog.HprintSites.Count); i++) {
+        int hpLine = 622;
+        for (int i = 0; i < prog.HprintSites.Count; i++) {
             HprintCallSite hp = prog.HprintSites[i];
             int cx = Math.Max(0, Math.Min(35, hp.Col));
             int cy = Math.Max(1, Math.Min(21, hp.Row));
             int cc = Math.Max(1, Math.Min(7, hp.Color));
             sb.AppendFormat("{0} HCOLOR {1}:HPRINT({2},{3}),\"{4}\"\r\n",
-                622 + i * 2, cc, cx, cy, hp.Text.Replace("\"", "'"));
+                hpLine, cc, cx, cy, hp.Text.Replace("\"", "'"));
+            hpLine += 1;
         }
-        sb.AppendLine("640 FOR I=2 TO NS");
-        sb.AppendLine("642  IF I<=14 THEN HCOLOR 1+(I AND 3):HPRINT(2,I+2),LEFT$(ST$(I),36)");
-        sb.AppendLine("644 NEXT I");
-        sb.AppendLine("650 HCOLOR 2:HCIRCLE(PX,PY),6,2:HLINE(PX-4,PY)-(PX+4,PY),PSET");
-        sb.AppendLine("660 HCOLOR 1:HPRINT(1,23),\"REG A:$\"+HEX$(RA)+\" B:$\"+HEX$(RB)+\" X:$\"+HEX$(RX)+\" [ARROWS/SPC/Q]\"");
-        sb.AppendLine("670 RETURN");
+        int strLoopLine = Math.Max(640, hpLine);
+        sb.AppendFormat("{0} FOR I=2 TO NS\r\n", strLoopLine);
+        sb.AppendFormat("{0}  IF I<=14 THEN HCOLOR 1+(I AND 3):HPRINT(2,I+2),LEFT$(ST$(I),36)\r\n", strLoopLine + 2);
+        sb.AppendFormat("{0} NEXT I\r\n", strLoopLine + 4);
+        sb.AppendFormat("{0} HCOLOR 2:HCIRCLE(PX,PY),6,2:HLINE(PX-4,PY)-(PX+4,PY),PSET\r\n", strLoopLine + 6);
+        sb.AppendFormat("{0} HCOLOR 1:HPRINT(1,23),\"REG A:$\"+HEX$(RA)+\" B:$\"+HEX$(RB)+\" X:$\"+HEX$(RX)+\" [ARROWS/SPC/Q]\"\r\n", strLoopLine + 8);
+        sb.AppendFormat("{0} RETURN\r\n", strLoopLine + 10);
         sb.AppendLine("700 ' ===== INITIALIZE 6809 REGISTERS, STACK, MEMORY & PALETTES =====");
         sb.AppendLine("710 RA=0:RB=0:RD=0:RX=MB:RY=MB:RU=MB:RS=MB+128:SP=0:FZ=0:FN=0:FC=0");
         sb.AppendLine("720 HX=0:HY=0:EX=160:EY=96:HC=1:ST=160:SD=2:PX=160:PY=96:SC=0");
@@ -1078,9 +1094,9 @@ static class Program {
         sb.AppendLine("760 FOR I=1 TO NS:READ ST$(I):NEXT I");
         sb.AppendLine("770 RETURN");
         sb.AppendLine("800 ' ===== SAFE MEMORY READ/WRITE HELPERS (AD -> VL) =====");
-        sb.AppendLine("810 AD=(AD AND 65535):IF AD>=MB AND AD<=MB+255 THEN VL=MM(AD-MB) ELSE VL=0");
+        sb.AppendLine("810 AD=(AD AND 65535):IF AD>=MB AND AD<=MB+NB THEN VL=MM(AD-MB) ELSE VL=0");
         sb.AppendLine("820 RETURN");
-        sb.AppendLine("830 AD=(AD AND 65535):VL=(VL AND 255):IF AD>=MB AND AD<=MB+255 THEN MM(AD-MB)=VL");
+        sb.AppendLine("830 AD=(AD AND 65535):VL=(VL AND 255):IF AD>=MB AND AD<=MB+NB THEN MM(AD-MB)=VL");
         sb.AppendLine("840 IF AD=65497 THEN POKE 65497,0");
         sb.AppendLine("850 IF AD=65496 THEN POKE 65496,0");
         sb.AppendLine("860 IF AD=65034 THEN HC=(VL AND 15):HCOLOR HC");
@@ -1094,8 +1110,8 @@ static class Program {
 
         for (int i = 0; i < codeList.Count; i++) {
             AsmInstruction ins = codeList[i];
-            int lineNo = 1000 + i * 10;
-            int nextLine = (i + 1 < codeList.Count) ? (1000 + (i + 1) * 10) : 3990;
+            int lineNo = 1000 + i * instrStep;
+            int nextLine = (i + 1 < codeList.Count) ? (1000 + (i + 1) * instrStep) : returnLine;
             string stmt = Translate6809InstructionToBasic(ins, addrToLine, nextLine);
             string fullLine = string.Format("{0} {1} ' ${2:X4}: {3} {4}", lineNo, stmt, ins.Address, ins.Mnemonic, ins.Operand);
             if (fullLine.Length > 235) {
@@ -1103,21 +1119,24 @@ static class Program {
             }
             sb.AppendLine(fullLine);
         }
-        sb.AppendLine("3990 RETURN");
+        sb.AppendFormat("{0} RETURN\r\n", returnLine);
 
-        // Emit DATA tables (Palettes, Initialized Memory Bytes, Extracted Strings)
-        sb.AppendLine("4000 ' ===== EXTRACTED PALETTE, MEMORY & STRING DATA =====");
-        sb.Append("4010 DATA ");
+        // Emit DATA tables (Palettes, Full Memory Image, All Extracted Strings)
+        int dataStep = ((initBytes.Count + 15) / 16 + strCount <= 2000) ? 10 : 1;
+        int dataHeaderLine = returnLine + dataStep;
+        int palDataLine = dataHeaderLine + dataStep;
+        sb.AppendFormat("{0} ' ===== EXTRACTED PALETTE, MEMORY & STRING DATA =====\r\n", dataHeaderLine);
+        sb.AppendFormat("{0} DATA ", palDataLine);
         for (int i = 0; i < 16; i++) {
             if (i > 0) sb.Append(",");
             sb.Append(pal[i]);
         }
         sb.AppendLine();
 
-        int dataLine = 4020;
+        int dataLine = palDataLine + dataStep;
         for (int i = 0; i < initBytes.Count; i += 16) {
             sb.AppendFormat("{0} DATA ", dataLine);
-            dataLine += 10;
+            dataLine += dataStep;
             int end = Math.Min(initBytes.Count, i + 16);
             for (int j = i; j < end; j++) {
                 if (j > i) sb.Append(",");
@@ -1126,13 +1145,12 @@ static class Program {
             sb.AppendLine();
         }
 
-        int strCount = Math.Max(1, Math.Min(20, prog.ExtractedStrings.Count));
         if (prog.ExtractedStrings.Count == 0) {
             sb.AppendFormat("{0} DATA \"{1}\"\r\n", dataLine, prog.BaseName.ToUpperInvariant());
         } else {
             for (int i = 0; i < strCount; i++) {
                 sb.AppendFormat("{0} DATA \"{1}\"\r\n", dataLine, prog.ExtractedStrings[i].Text.Replace("\"", "'"));
-                dataLine += 10;
+                dataLine += dataStep;
             }
         }
         return sb.ToString();
@@ -2061,7 +2079,7 @@ static class Program {
         sb.AppendFormat("30 ' Original Load Address: ${0:X4} ({1} Bytes)\r\n", loadAddr, totalBytes);
         sb.AppendLine("40 ' ============================================================");
         sb.AppendLine("50 CLEAR 1000:POKE 65497,0");
-        int count = Math.Min(256, Math.Max(16, totalBytes));
+        int count = Math.Max(16, totalBytes);
         sb.AppendFormat("60 NB={0}:AD={1}:DIM DB(NB)\r\n", count - 1, (int)loadAddr);
         sb.AppendLine("70 FOR I=0 TO NB:READ DB(I):NEXT I");
         sb.AppendLine("80 HSCREEN 2:PALETTE 0,0:PALETTE 1,63:PALETTE 2,54");

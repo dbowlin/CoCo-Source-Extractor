@@ -1,25 +1,23 @@
 # CoCo Source Extractor
 
-**CoCo Source Extractor** is a Windows GUI and CLI tool that extracts classic TRS-80 / Tandy Color Computer (CoCo 1/2/3) disk images, cartridges, cassettes, and binary files and converts them into readable, runnable source code you can study, edit, and run. 
+**CoCo Source Extractor** is a Windows tool that opens classic TRS-80 / Tandy Color Computer (CoCo 1/2/3) disk images, cartridges, cassettes, and binary files and turns them into clean, readable source code you can study, learn from, edit, and run.
 
-**Note:** the created BASIC code is not a one-to-one clone, as some things are lost in the translation from machine code to BASIC.
+**Note:** the created BASIC code is a brand-new recreation of the original program rather than a one-to-one copy, written in plain, beginner-friendly Super Extended Color BASIC 2.1 so new programmers can easily read how it works.
 
-- **`.asm` (6809 Assembly)** is disassembled using [`f9dasm`](https://github.com/Arakula/f9dasm) with CoCo 3 hardware/ROM symbols (`coco3.info`) and [`decb` (ToolShed)](https://github.com/nitros9project/toolshed).
-- **`.bas` (Super Extended Color BASIC 2.1)** is generated directly from the disassembled 6809 control-flow graph, subroutines, ROM calls, GIME palettes, strings, and data tables—producing pure BASIC source code without `POKE`/`EXEC` machine-language stubs. Because pure BASIC is interpreted, the `.bas` output runs slower than native 6809 machine code and is designed for learning, inspection, and tinkering on CoCo 3 emulators and hardware.
+- **`.asm` (6809 Assembly)** — The original machine code extracted and disassembled using [`f9dasm`](https://github.com/Arakula/f9dasm) and [`decb` (ToolShed)](https://github.com/nitros9project/toolshed).
+- **`.bas` (Super Extended Color BASIC 2.1)** — A complete, easy-to-read BASIC version of the program:
+  - Written **one step per line** with clear comments explaining what each part does.
+  - Uses standard CoCo 3 BASIC commands for screens, colors, shapes, text, keyboard input, and sound—no raw machine-code tricks or giant hex dumps.
+  - Native BASIC programs already stored on a disk or tape are extracted directly and never overwritten.
 
 ---
 
 ## What It Does
 
-When you open a CoCo file, the app automatically creates a `<filename>_source` folder next to your file containing:
+When you open a CoCo file, the app creates a `<filename>_source` folder next to your file containing:
 
-- **`.asm` (6809 Disassembly)** — Multi-block DECB binaries, unpacked self-extracting cartridge ROMs, and raw binaries disassembled with CoCo hardware (`$FF00–$FFFF`) and ROM (`$A000–$FEFF`) labels.
-- **`.bas` (Extended Color BASIC 2.1)** — Pure BASIC source code reconstructed from the binary:
-  - **6809 Control-Flow & Data Separation:** Traces reachable code from the execution entry address (`DECB Execution Address`), subroutine calls (`BSR`/`LBSR`/`JSR`), and conditional branches so strings and data tables are cleanly separated from code.
-  - **Multi-File / Data Block Linking:** Automatically links companion data files on the same disk or folder (such as `CELLDATA.DAT` loaded at `$7B00` by `2048.BIN`) into a unified 64 KB memory map, and generates interactive `HSCREEN 2` visual data/grid inspectors for standalone data binaries (`.DAT`, `.CHR`, `.PIC`, `.MAP`).
-  - **CoCo 3 ROM & Hardware Lifting:** Translates CoCo ROM routines (`POLCAT`/`INKEY$`, `CHROUT`, `HSCREEN`, `HPRINT`, `HLINE`, `SOUND`) and GIME/SAM hardware registers (1.78 MHz speed pokes, 16-color RGB/Composite palettes, border colors) plus 6809 instructions and addressing modes into valid Extended Color BASIC 2.1.
-  - **Built-in BASIC Linter:** Verifies line numbers, branch targets (`GOTO`/`GOSUB`/`THEN`/`RESTORE`), line length limits ($\le 248$ chars), and Color BASIC 2-character variable rules.
-  - **Preserve Native BASIC:** Tokenized BASIC files on disks or tapes are detokenized directly via `decb` and never overwritten by binary decompilations on the same disk.
+- **`.asm`** — The disassembled 6809 assembly listing for reference.
+- **`.bas`** — A clean, commented Super Extended Color BASIC 2.1 version of the game or utility, designed for beginners to read and learn from.
 
 ### Supported File Types
 - Disk Images (`.dsk`)
@@ -44,8 +42,10 @@ Run from PowerShell or Command Prompt with `--cli` (or `--headless`):
 Start-Process -FilePath ".\CoCoSourceExtractor.exe" -ArgumentList @("--cli", "`"path\to\game.dsk`"") -Wait
 ```
 
-### Optional Cloud LLM Decompilation
-The extractor works completely offline out of the box using its built-in deterministic 6809 decompiler. If you want to enable cloud LLM decompilation for custom binaries, set `GEMINI_API_KEY` (or `GOOGLE_API_KEY` / `XAI_API_KEY`) in your environment or place your key in `api_key.txt` in the application folder.
+### API Key Setup (Required for Creating `.bas` Files)
+To read the `.asm` file and write a clean, beginner-friendly `.bas` program, the app uses an AI service (Anthropic Claude, Google Gemini, or xAI Grok).
+
+Put your API key in a plain text file named `api_key.txt` in the same folder as `CoCoSourceExtractor.exe` (or set `ANTHROPIC_API_KEY`, `GEMINI_API_KEY`, `GOOGLE_API_KEY`, or `XAI_API_KEY` in your Windows environment variables). The app automatically detects which service your key belongs to.
 
 ---
 

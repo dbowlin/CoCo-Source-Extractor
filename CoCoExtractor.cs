@@ -214,6 +214,7 @@ static class Program {
         public HashSet<ushort> RomCalls = new HashSet<ushort>();
         public HashSet<ushort> HardwareRefs = new HashSet<ushort>();
         public Dictionary<ushort, byte> MemoryMap = new Dictionary<ushort, byte>();
+        public Dictionary<ushort, List<ushort>> JumpTables = new Dictionary<ushort, List<ushort>>();
         public List<ParsedProgram> AttachedDataPrograms = new List<ParsedProgram>();
 
         public byte ReadByte(int addr) {
@@ -462,6 +463,35 @@ static class Program {
                         AsmInstruction tIns = prog.Instructions[prog.AddrToInstructionIndex[target]];
                         tIns.IsSubroutineEntry = true;
                         if (!tIns.IsReachableCode) work.Enqueue(target);
+                    } else if (ins.Operand.Contains("[")) {
+                        // Resolve indirect jump table (e.g., LDX #table; JSR [A,X])
+                        for (int back = idx - 1; back >= Math.Max(0, idx - 6); back--) {
+                            AsmInstruction prev = prog.Instructions[back];
+                            if (prev.Mnemonic == "LDX" || prev.Mnemonic == "LDY" || prev.Mnemonic == "LDU") {
+                                ushort tblAddr = ParseTargetAddress(prev.Operand);
+                                if (tblAddr != 0 && prog.HasAddressRange(tblAddr, 2)) {
+                                    List<ushort> jtTargets = new List<ushort>();
+                                    int misses = 0;
+                                    for (int k = 0; k < 64; k++) {
+                                        if (!prog.HasAddressRange(tblAddr + k * 2, 2)) break;
+                                        ushort ptr = (ushort)((prog.ReadByte(tblAddr + k * 2) << 8) | prog.ReadByte(tblAddr + k * 2 + 1));
+                                        if (ptr < 0x0600 || ptr >= 0xFF00) break;
+                                        if (!prog.AddrToInstructionIndex.ContainsKey(ptr)) {
+                                            misses++;
+                                            if (misses >= 2) break;
+                                            continue;
+                                        }
+                                        misses = 0;
+                                        jtTargets.Add(ptr);
+                                        AsmInstruction jtIns = prog.Instructions[prog.AddrToInstructionIndex[ptr]];
+                                        jtIns.IsSubroutineEntry = true;
+                                        if (!jtIns.IsReachableCode) work.Enqueue(ptr);
+                                    }
+                                    if (jtTargets.Count > 0) prog.JumpTables[ins.Address] = jtTargets;
+                                }
+                                break;
+                            }
+                        }
                     }
                 } else if (IsBranchMnemonic(ins.Mnemonic)) {
                     ushort target = ParseTargetAddress(ins.Operand);
@@ -682,6 +712,11 @@ static class Program {
             basFileName = prog.BaseName + "_ML.bas";
         }
         string basOutput = GenerateBasicSource(prog);
+        if (string.IsNullOrEmpty(basOutput)) {
+            string stale = Path.Combine(outDir, basFileName);
+            if (File.Exists(stale)) File.Delete(stale);
+            return;
+        }
         string lintReport;
         if (!ValidateBasicSource(basOutput, out lintReport)) {
             LogLines.Add("BASIC Linter Warning for " + prog.BaseName + ": " + lintReport);
@@ -756,11 +791,16 @@ static class Program {
     }
 
     // =========================================================================
-    // OPTIONAL CLOUD LLM DECOMPILER (GEMINI / GROK)
+    // OPTIONAL CLOUD LLM DECOMPILER (ANTHROPIC / GEMINI / GROK)
     // =========================================================================
 
     static string GetConfiguredApiKey(out string provider) {
         provider = "";
+        string anthropicKey = Environment.GetEnvironmentVariable("ANTHROPIC_API_KEY");
+        if (!string.IsNullOrEmpty(anthropicKey)) {
+            provider = "anthropic";
+            return anthropicKey.Trim();
+        }
         string geminiKey = Environment.GetEnvironmentVariable("GEMINI_API_KEY");
         if (string.IsNullOrEmpty(geminiKey)) geminiKey = Environment.GetEnvironmentVariable("GOOGLE_API_KEY");
         if (!string.IsNullOrEmpty(geminiKey)) {
@@ -776,11 +816,298 @@ static class Program {
         if (File.Exists(keyFile)) {
             string raw = File.ReadAllText(keyFile).Trim();
             if (!string.IsNullOrEmpty(raw)) {
-                provider = raw.StartsWith("xai-", StringComparison.OrdinalIgnoreCase) ? "xai" : "gemini";
+                if (raw.StartsWith("sk-ant-", StringComparison.OrdinalIgnoreCase)) provider = "anthropic";
+                else if (raw.StartsWith("xai-", StringComparison.OrdinalIgnoreCase)) provider = "xai";
+                else provider = "gemini";
                 return raw;
             }
         }
         return "";
+    }
+
+    static string WorkingGeminiModel = "";
+    static string WorkingAnthropicModel = "";
+
+    static string CallGeminiOrXai(string provider, string apiKey, string promptText, out string errMsg) {
+        errMsg = "";
+        string escapedPrompt = EscapeJsonString(promptText);
+        string[] models;
+        if (provider == "gemini") {
+            models = !string.IsNullOrEmpty(WorkingGeminiModel)
+                ? new string[] { WorkingGeminiModel }
+                : new string[] { "gemini-3.1-pro-preview", "gemini-3-flash-preview" };
+        } else if (provider == "anthropic") {
+            models = !string.IsNullOrEmpty(WorkingAnthropicModel)
+                ? new string[] { WorkingAnthropicModel }
+                : new string[] { "claude-sonnet-4-5-20250929", "claude-sonnet-4-20250514", "claude-3-7-sonnet-20250219" };
+        } else {
+            models = new string[] { "grok-3-mini" };
+        }
+
+        for (int attempt = 0; attempt < models.Length; attempt++) {
+            string modelName = models[attempt];
+            for (int retry = 0; retry < 4; retry++) {
+                try {
+                    string url;
+                    string bodyJson;
+                    if (provider == "gemini") {
+                        url = "https://generativelanguage.googleapis.com/v1beta/models/" + modelName + ":generateContent?key=" + apiKey;
+                        bodyJson = "{\"contents\":[{\"parts\":[{\"text\":\"" + escapedPrompt + "\"}]}],\"generationConfig\":{\"temperature\":0.1,\"maxOutputTokens\":65536}}";
+                    } else if (provider == "anthropic") {
+                        url = "https://api.anthropic.com/v1/messages";
+                        bodyJson = "{\"model\":\"" + modelName + "\",\"max_tokens\":16384,\"temperature\":0.1,\"messages\":[{\"role\":\"user\",\"content\":\"" + escapedPrompt + "\"}]}";
+                    } else {
+                        url = "https://api.x.ai/v1/chat/completions";
+                        bodyJson = "{\"model\":\"" + modelName + "\",\"temperature\":0.1,\"messages\":[{\"role\":\"user\",\"content\":\"" + escapedPrompt + "\"}]}";
+                    }
+
+                    HttpWebRequest req = (HttpWebRequest)WebRequest.Create(url);
+                    req.Method = "POST";
+                    req.ContentType = "application/json";
+                    req.Timeout = 900000;
+                    req.ReadWriteTimeout = 900000;
+                    if (provider == "anthropic") {
+                        req.Headers.Add("x-api-key", apiKey);
+                        req.Headers.Add("anthropic-version", "2023-06-01");
+                    } else if (provider == "xai") {
+                        req.Headers.Add("Authorization", "Bearer " + apiKey);
+                    }
+                    byte[] postBytes = Encoding.UTF8.GetBytes(bodyJson);
+                    using (Stream reqStream = req.GetRequestStream()) {
+                        reqStream.Write(postBytes, 0, postBytes.Length);
+                    }
+                    using (HttpWebResponse resp = (HttpWebResponse)req.GetResponse())
+                    using (StreamReader sr = new StreamReader(resp.GetResponseStream(), Encoding.UTF8)) {
+                        string json = sr.ReadToEnd();
+                        if (json.Contains("\"MAX_TOKENS\"") || json.Contains("\"max_tokens\"")) {
+                            LogLines.Add("LLM WARNING (" + modelName + "): response hit max tokens and may be truncated.");
+                        }
+                        string candidate = CleanLlmBasicOutput(ExtractTextFromLlmJson(json));
+                        if (!string.IsNullOrEmpty(candidate)) {
+                            if (provider == "gemini") WorkingGeminiModel = modelName;
+                            else if (provider == "anthropic") WorkingAnthropicModel = modelName;
+                            LogLines.Add("LLM OK (" + modelName + "): " + candidate.Split('\n').Length + " BASIC lines returned.");
+                            return candidate;
+                        }
+                        errMsg = modelName + " returned no numbered BASIC lines.";
+                        LogLines.Add("LLM EMPTY (" + modelName + "): " + (json.Length > 400 ? json.Substring(0, 400) : json));
+                        break;
+                    }
+                } catch (WebException wex) {
+                    int code = 0;
+                    string body = "";
+                    HttpWebResponse er = wex.Response as HttpWebResponse;
+                    if (er != null) {
+                        code = (int)er.StatusCode;
+                        try { using (StreamReader esr = new StreamReader(er.GetResponseStream())) body = esr.ReadToEnd(); } catch { }
+                    }
+                    Match msgM = Regex.Match(body, "\"message\"\\s*:\\s*\"((?:\\\\.|[^\"\\\\])*)\"");
+                    string apiMsg = msgM.Success ? JsonUnescape(msgM.Groups[1].Value) : wex.Message;
+                    if (apiMsg.Length > 300) apiMsg = apiMsg.Substring(0, 300);
+                    errMsg = modelName + " HTTP " + code + ": " + apiMsg;
+                    LogLines.Add("LLM API attempt failed (" + errMsg + ")");
+                    bool transient = (code == 429 || code == 500 || code == 503 || code == 0);
+                    bool quotaZero = body.Contains("limit: 0");
+                    if (transient && !quotaZero && retry < 3) {
+                        System.Threading.Thread.Sleep(15000 * (retry + 1));
+                        continue;
+                    }
+                    break;
+                } catch (Exception ex) {
+                    errMsg = modelName + ": " + ex.Message;
+                    LogLines.Add("LLM API attempt failed (" + errMsg + ")");
+                    break;
+                }
+            }
+        }
+        if (!string.IsNullOrEmpty(errMsg)) LastLlmFailure = errMsg;
+        return "";
+    }
+
+    static string JsonUnescape(string raw) {
+        StringBuilder sb = new StringBuilder(raw.Length);
+        for (int i = 0; i < raw.Length; i++) {
+            char c = raw[i];
+            if (c != '\\' || i + 1 >= raw.Length) { sb.Append(c); continue; }
+            char n = raw[++i];
+            switch (n) {
+                case 'n': sb.Append('\n'); break;
+                case 'r': sb.Append('\r'); break;
+                case 't': sb.Append('\t'); break;
+                case 'b': sb.Append('\b'); break;
+                case 'f': sb.Append('\f'); break;
+                case '/': sb.Append('/'); break;
+                case '"': sb.Append('"'); break;
+                case '\\': sb.Append('\\'); break;
+                case 'u':
+                    if (i + 4 < raw.Length) {
+                        sb.Append((char)int.Parse(raw.Substring(i + 1, 4), NumberStyles.HexNumber));
+                        i += 4;
+                    }
+                    break;
+                default: sb.Append(n); break;
+            }
+        }
+        return sb.ToString();
+    }
+
+    static string ExtractSubroutineAsmSlice(ParsedProgram prog, ushort startAddr, int maxIns) {
+        int idx;
+        if (!prog.AddrToInstructionIndex.TryGetValue(startAddr, out idx)) return "";
+        StringBuilder sb = new StringBuilder();
+        for (int k = 0; k < maxIns && idx + k < prog.Instructions.Count; k++) {
+            AsmInstruction ins = prog.Instructions[idx + k];
+            if (k > 0 && ins.IsSubroutineEntry) break;
+            sb.AppendFormat("  ${0:X4}: {1,-6} {2}\r\n", ins.Address, ins.Mnemonic, ins.Operand);
+            if (ins.Mnemonic == "RTS" || ins.Mnemonic == "RTI" ||
+                (ins.Mnemonic == "PULS" && ins.Operand.IndexOf("PC", StringComparison.OrdinalIgnoreCase) >= 0)) {
+                break;
+            }
+        }
+        return sb.ToString();
+    }
+
+    static List<ushort> FindStubbedSubroutines(string bas, Dictionary<ushort, int> subLineMap) {
+        List<ushort> result = new List<ushort>();
+        Regex lineRx = new Regex(@"^\s*(\d+)\s+(.*)$");
+        SortedDictionary<int, string> byLine = new SortedDictionary<int, string>();
+        foreach (string l in bas.Split(new char[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries)) {
+            Match m = lineRx.Match(l);
+            if (m.Success) byLine[int.Parse(m.Groups[1].Value)] = m.Groups[2].Value.Trim();
+        }
+        foreach (KeyValuePair<ushort, int> kv in subLineMap) {
+            int realStatements = 0;
+            foreach (KeyValuePair<int, string> ln in byLine) {
+                if (ln.Key < kv.Value || ln.Key >= kv.Value + 200) continue;
+                string body = ln.Value.ToUpperInvariant();
+                if (body.StartsWith("REM") || body.StartsWith("'") || body == "RETURN") continue;
+                realStatements++;
+            }
+            if (realStatements == 0) result.Add(kv.Key);
+        }
+        return result;
+    }
+
+    static string RemoveLineRanges(string bas, List<ushort> subs, Dictionary<ushort, int> subLineMap) {
+        Regex lineRx = new Regex(@"^\s*(\d+)\s+");
+        StringBuilder sb = new StringBuilder();
+        foreach (string l in bas.Split(new char[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries)) {
+            Match m = lineRx.Match(l);
+            bool drop = false;
+            if (m.Success) {
+                int n = int.Parse(m.Groups[1].Value);
+                foreach (ushort s in subs) {
+                    int b = subLineMap[s];
+                    if (n >= b && n < b + 200) { drop = true; break; }
+                }
+            }
+            if (!drop) sb.AppendLine(l);
+        }
+        return sb.ToString();
+    }
+
+    static bool LooksLikeRegisterSimulator(string bas) {
+        if (string.IsNullOrEmpty(bas)) return false;
+        string[] rawLines = bas.Split(new char[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries);
+        int codeLines = 0;
+        int simHits = 0;
+        int peekPokeLines = 0;
+        Regex lineRx = new Regex(@"^\s*\d+\s+(.*)$");
+        for (int i = 0; i < rawLines.Length; i++) {
+            Match m = lineRx.Match(rawLines[i]);
+            if (!m.Success) continue;
+            string body = m.Groups[1].Value.TrimStart();
+            if (body.StartsWith("'") || body.StartsWith("REM", StringComparison.OrdinalIgnoreCase) ||
+                body.StartsWith("DATA", StringComparison.OrdinalIgnoreCase)) continue;
+            int tick = body.IndexOf('\'');
+            if (tick >= 0) body = body.Substring(0, tick);
+            int remIdx = body.IndexOf("REM", StringComparison.OrdinalIgnoreCase);
+            if (remIdx >= 0) body = body.Substring(0, remIdx);
+            codeLines++;
+            if (Regex.IsMatch(body, @"\b(?:FZ|FC|FN)=\(|\bGOSUB 8[13]0\b|\bRA=VL\b|\bMM\(AD-MB\)")) simHits++;
+            if (Regex.IsMatch(body, @"\b(?:PEEK|POKE)\b", RegexOptions.IgnoreCase) &&
+                !Regex.IsMatch(body, @"\bPOKE\s+(?:6549[67]|&HFFD[89])\b", RegexOptions.IgnoreCase)) peekPokeLines++;
+        }
+        return simHits > Math.Max(10, codeLines / 10) || peekPokeLines > 2;
+    }
+
+    static string AppendBinaryAssetsAndBlitter(ParsedProgram prog, string llmBas) {
+        // Strip any lines >= 9000 from LLM output so our 9000+ blitter & 10000+ DATA tables never collide
+        StringBuilder sb = new StringBuilder();
+        string[] lines = llmBas.Split(new char[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries);
+        Regex numRx = new Regex(@"^\s*(\d+)\s+(.*)$");
+        for (int i = 0; i < lines.Length; i++) {
+            Match m = numRx.Match(lines[i]);
+            if (m.Success) {
+                int ln = int.Parse(m.Groups[1].Value);
+                if (ln < 9000) sb.AppendLine(ln + " " + m.Groups[2].Value.Trim());
+            }
+        }
+
+        ushort minAddr = prog.Blocks.Count > 0 ? prog.Blocks[0].LoadAddress : prog.ExecAddress;
+        List<byte> initBytes = new List<byte>();
+        if (prog.MemoryMap.Count > 0) {
+            minAddr = ushort.MaxValue;
+            ushort maxAddr = 0;
+            foreach (ushort addr in prog.MemoryMap.Keys) {
+                if (addr < minAddr) minAddr = addr;
+                if (addr > maxAddr) maxAddr = addr;
+            }
+            int span = (maxAddr - minAddr) + 1;
+            for (int i = 0; i < span; i++) initBytes.Add(prog.ReadByte(minAddr + i));
+        } else if (prog.Blocks.Count > 0) {
+            for (int i = 0; i < prog.Blocks[0].RawBytes.Count; i++) initBytes.Add(prog.Blocks[0].RawBytes[i]);
+        }
+        while (initBytes.Count < 16) initBytes.Add(0);
+
+        sb.AppendLine("9000 REM *** LOAD ORIGINAL BINARY ASSETS INTO MM(0..NB) ***");
+        sb.AppendFormat("9010 MB={0}:NB={1}:DIM MM({1})\r\n", (int)minAddr, initBytes.Count - 1);
+        sb.AppendLine("9020 RESTORE 10000");
+        sb.AppendLine("9030 FOR MI=0 TO NB:READ MV:MM(MI)=MV:NEXT MI");
+        sb.AppendLine("9040 RETURN");
+        sb.AppendLine("9100 REM *** COCO 3 16-COLOR PACKED-PIXEL BITMAP BLITTER (BX,BY,BW,BH,BA) ***");
+        sb.AppendLine("9110 FOR RY=0 TO BH-1:PY=BY+RY:IF PY<0 OR PY>191 THEN 9160");
+        sb.AppendLine("9120 FOR RX=0 TO BW-1:AD=BA+RY*BW+RX:IF AD>=MB AND AD<=MB+NB THEN BV=MM(AD-MB) ELSE BV=0");
+        sb.AppendLine("9130 PX=BX+RX*2:C1=INT(BV/16):C2=BV AND 15");
+        sb.AppendLine("9140 IF PX>=0 AND PX<=319 THEN HCOLOR C1:PSET(PX,PY)");
+        sb.AppendLine("9150 IF PX+1>=0 AND PX+1<=319 THEN HCOLOR C2:PSET(PX+1,PY)");
+        sb.AppendLine("9160 NEXT RX:NEXT RY:RETURN");
+        sb.AppendLine("9200 REM *** SOLID 16-COLOR RECTANGLE FILL (BX,BY,BW,BH,BC) ***");
+        sb.AppendLine("9210 HCOLOR (BC AND 15):HLINE(BX,BY)-(BX+BW*2-1,BY+BH-1),PSET,BF:RETURN");
+        sb.AppendLine("10000 REM *** FULL EXTRACTED BINARY GRAPHICS, SPRITE, SOUND & TABLE DATA ***");
+
+        int dataLine = 10010;
+        for (int i = 0; i < initBytes.Count; i += 16) {
+            sb.AppendFormat("{0} DATA ", dataLine);
+            dataLine += 10;
+            int end = Math.Min(initBytes.Count, i + 16);
+            for (int j = i; j < end; j++) {
+                if (j > i) sb.Append(",");
+                sb.Append(initBytes[j]);
+            }
+            sb.AppendLine();
+        }
+        return sb.ToString();
+    }
+
+    static string MergeBasicSections(List<string> sections) {
+        SortedDictionary<int, string> byLine = new SortedDictionary<int, string>();
+        Regex lineRx = new Regex(@"^\s*(\d+)\s+(.*)$");
+        for (int s = 0; s < sections.Count; s++) {
+            string[] lines = sections[s].Split(new char[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries);
+            for (int i = 0; i < lines.Length; i++) {
+                Match m = lineRx.Match(lines[i]);
+                if (m.Success) {
+                    int ln = int.Parse(m.Groups[1].Value);
+                    byLine[ln] = ln + " " + m.Groups[2].Value;
+                }
+            }
+        }
+        StringBuilder sb = new StringBuilder();
+        foreach (KeyValuePair<int, string> kv in byLine) {
+            sb.AppendLine(kv.Value);
+        }
+        return sb.ToString();
     }
 
     static bool TryDecompileWithLlm(ParsedProgram prog, out string basOutput) {
@@ -791,59 +1118,64 @@ static class Program {
 
         try {
             ServicePointManager.SecurityProtocol = (SecurityProtocolType)3072; // TLS 1.2
+            StringBuilder cleanAsm = new StringBuilder();
+            for (int i = 0; i < prog.Instructions.Count; i++) {
+                AsmInstruction ins = prog.Instructions[i];
+                if (ins.Address >= 0x4000 && !ins.IsReachableCode && prog.ExecAddress < 0x4000) continue;
+                if (ins.IsSubroutineEntry) cleanAsm.AppendFormat("\r\n; --- SUBROUTINE ${0:X4} ---\r\n", ins.Address);
+                cleanAsm.AppendFormat("${0:X4}: {1,-6} {2}\r\n", ins.Address, ins.Mnemonic, ins.Operand);
+                if (cleanAsm.Length > 140000) break;
+            }
+
             StringBuilder prompt = new StringBuilder();
-            prompt.AppendLine("You are an expert Motorola 6809 reverse engineer and Tandy Color Computer 3 Super Extended Color BASIC 2.1 developer.");
-            prompt.AppendLine("Decompile the following 6809 assembly program and its data blocks into a complete, playable, faithful pure Extended Color BASIC 2.1 (.bas) program.");
+            prompt.AppendLine("You are an expert Motorola 6809 reverse engineer and Tandy Color Computer 3 Super Extended Color BASIC 2.1 teacher.");
+            prompt.AppendLine("GOAL: Read the disassembled 6809 assembly (.asm) below, understand everything the original CoCo program/game/utility does (its title screen, artwork/tiles/sprites, UI layout, colors/palettes, controls, game rules/logic, animations, demo/attract mode, scoring, and sound effects), and WRITE A COMPLETE, BEGINNER-FRIENDLY Super Extended Color BASIC 2.1 (.bas) program that recreates the entire program.");
+            prompt.AppendLine("TARGET AUDIENCE: Absolute beginner programmers who will read this .bas source code to learn how a complete CoCo 3 BASIC game/program is structured and written.");
             prompt.AppendLine("STRICT RULES:");
-            prompt.AppendLine("1. Output ONLY numbered BASIC lines (10, 20, ...). No Markdown fences.");
-            prompt.AppendLine("2. Do NOT use POKE/EXEC machine code stubs. Translate the actual subroutines, game mechanics, strings, palettes, and data tables into pure BASIC.");
-            prompt.AppendLine("3. CoCo BASIC only recognizes the FIRST 2 CHARACTERS of variable names. Use unique 1- or 2-character variable names and NEVER use reserved words (GO, TO, OR, ON, IF, FN, AS) as variable names.");
-            prompt.AppendLine("4. Do NOT use WHILE/WEND, DO/LOOP, or multi-line END IF. Use IF ... THEN ... and FOR ... NEXT and GOSUB ... RETURN.");
-            prompt.AppendLine("5. Keep every line under 240 characters.");
-            prompt.AppendFormat("Program Name: {0}, Entry Address: ${1:X4}\r\n", prog.BaseName, prog.ExecAddress);
-            prompt.AppendLine("Extracted Strings:");
-            for (int i = 0; i < Math.Min(40, prog.ExtractedStrings.Count); i++) {
-                prompt.AppendFormat("  ${0:X4}: \"{1}\"\r\n", prog.ExtractedStrings[i].Address, prog.ExtractedStrings[i].Text);
+            prompt.AppendLine("1. Output ONLY numbered BASIC lines (step by 10: 10, 20, 30, ...). No Markdown fences, no prose before or after.");
+            prompt.AppendLine("2. ONE STATEMENT PER LINE: Do NOT combine multiple BASIC statements onto a single line with colons ':' unless required inside a single-line IF ... THEN ... statement! Put every DIM, FOR, loop body statement, NEXT, PALETTE, HCOLOR, HLINE, HCIRCLE, HPAINT, HPRINT, SOUND, READ, and variable assignment on its own separate numbered line so beginners can easily read it line by line.");
+            prompt.AppendLine("3. BEGINNER COMMENTS: Include clear, helpful REM or ' comment lines before every section, subroutine, variable setup, and key step explaining what the code does and how the CoCo 3 BASIC commands work.");
+            prompt.AppendLine("4. NO RAW BINARY DATA DUMPS & NO PEEK/POKE: Do NOT dump raw machine-code/bitmap bytes into DATA statements, and do NOT use PEEK or POKE (the ONLY allowed POKEs are POKE 65497,0 for 1.78 MHz high-speed mode and POKE 65496,0 for normal speed, with a comment explaining them). Use DATA statements ONLY for small, human-readable tables (such as the 16 palette colors, stage/item names and colors, sound notes, or demo move directions).");
+            prompt.AppendLine("5. 100% NATIVE PROCEDURAL BASIC GRAPHICS & SOUND: Recreate all visuals (title screen logo/art, board/grid, distinct procedural artwork/icons for every tile/sprite stage, score/high-score HUD, and win/game-over banners) using native Super Extended Color BASIC 2.1 commands:");
+            prompt.AppendLine("   - Screen & Palettes: HSCREEN 2 (320x192 16-color mode), PALETTE slot,color, HCLS color");
+            prompt.AppendLine("   - Drawing & Text: HCOLOR c, HLINE(x1,y1)-(x2,y2),PSET (or ,PSET,B for box or ,PSET,BF for filled box), HCIRCLE(x,y),r, HPAINT(x,y),c,border, HPRINT(col,row),text$ (0<=col<=39, 0<=row<=23)");
+            prompt.AppendLine("   - Input & Sound: K$=INKEY$, ASC(K$), SOUND tone,duration");
+            prompt.AppendLine("6. Recreate ALL screens, features, and mechanics of the original program completely (title screen, idle attract/demo mode if present, main gameplay/utility loop, all directional movement/merging/collision rules, procedural sprite/tile artwork for all stages, win/loss detection and screens, score & high score, and sound effects). Never leave stubbed subroutines or 'TODO'/'SIMPLIFIED' placeholders.");
+            prompt.AppendLine("7. CoCo BASIC only recognizes the FIRST 2 CHARACTERS of variable names. Use unique 1- or 2-character variable names and NEVER use reserved words (GO, TO, OR, ON, IF, FN, AS) as variable names. Do NOT use WHILE/WEND, DO/LOOP, MOD, XOR, or multi-line END IF.");
+            prompt.AppendLine("8. Keep every line under 240 characters, with strictly increasing line numbers.");
+            prompt.AppendFormat("\r\nProgram Name: {0}, Entry Address: ${1:X4}, Subroutines ({2}):\r\n", prog.BaseName, prog.ExecAddress, prog.SubroutineTargets.Count);
+            if (prog.SubroutineTargets.Count > 0) {
+                List<string> subList = new List<string>();
+                for (int i = 0; i < prog.SubroutineTargets.Count; i++) subList.Add(string.Format("${0:X4}", prog.SubroutineTargets[i]));
+                prompt.AppendLine("  " + string.Join(", ", subList.ToArray()));
             }
-            prompt.AppendLine("Assembly Listing (reachable code & tables):");
-            string asmText = File.Exists(prog.SourceAsmPath) ? File.ReadAllText(prog.SourceAsmPath) : "";
-            if (asmText.Length > 28000) asmText = asmText.Substring(0, 28000);
-            prompt.AppendLine(asmText);
+            prompt.AppendLine("Memory Blocks:");
+            for (int i = 0; i < prog.Blocks.Count; i++) {
+                prompt.AppendFormat("  Block {0}: ${1:X4} ({2} bytes)\r\n", i + 1, prog.Blocks[i].LoadAddress, prog.Blocks[i].RawBytes.Count);
+            }
+            prompt.AppendLine("\r\n6809 Assembly Listing:");
+            prompt.AppendLine(cleanAsm.ToString());
 
-            string escapedPrompt = EscapeJsonString(prompt.ToString());
-            string url;
-            string bodyJson;
-            if (provider == "gemini") {
-                url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-pro:generateContent?key=" + apiKey;
-                bodyJson = "{\"contents\":[{\"parts\":[{\"text\":\"" + escapedPrompt + "\"}]}],\"generationConfig\":{\"temperature\":0.1}}";
-            } else {
-                url = "https://api.x.ai/v1/chat/completions";
-                bodyJson = "{\"model\":\"grok-3-mini\",\"temperature\":0.1,\"messages\":[{\"role\":\"user\",\"content\":\"" + escapedPrompt + "\"}]}";
-            }
-
-            HttpWebRequest req = (HttpWebRequest)WebRequest.Create(url);
-            req.Method = "POST";
-            req.ContentType = "application/json";
-            req.Timeout = 90000;
-            if (provider == "xai") {
-                req.Headers.Add("Authorization", "Bearer " + apiKey);
-            }
-            byte[] postBytes = Encoding.UTF8.GetBytes(bodyJson);
-            using (Stream reqStream = req.GetRequestStream()) {
-                reqStream.Write(postBytes, 0, postBytes.Length);
-            }
-            using (HttpWebResponse resp = (HttpWebResponse)req.GetResponse())
-            using (StreamReader sr = new StreamReader(resp.GetResponseStream(), Encoding.UTF8)) {
-                string json = sr.ReadToEnd();
-                string candidate = ExtractTextFromLlmJson(json);
-                candidate = CleanLlmBasicOutput(candidate);
-                string lintReport;
-                if (!string.IsNullOrEmpty(candidate) && ValidateBasicSource(candidate, out lintReport)) {
-                    basOutput = candidate;
+            string errMsg = "";
+            for (int qTry = 0; qTry < 3; qTry++) {
+                string singleBas = CallGeminiOrXai(provider, apiKey, prompt.ToString(), out errMsg);
+                if (!string.IsNullOrEmpty(singleBas) && LooksLikeRegisterSimulator(singleBas)) {
+                    LastLlmFailure = "LLM output used raw PEEK/POKE or register simulation instead of pure BASIC; rejected.";
+                    prompt.AppendLine("\r\nIMPORTANT CORRECTION: Your previous output used raw PEEK/POKE on memory/hardware addresses. Rewrite the ENTIRE program using ONLY native Super Extended Color BASIC 2.1 variables, DIM arrays, HSCREEN 2, PALETTE, HCLS, HCOLOR, HLINE, HPRINT, INKEY$, SOUND, and DATA tables (NO PEEK and NO POKE except POKE 65497,0 / POKE 65496,0).");
+                    continue;
+                }
+                if (!string.IsNullOrEmpty(singleBas)) {
+                    string lintReport;
+                    if (!ValidateBasicSource(singleBas, out lintReport)) {
+                        LogLines.Add("LLM BASIC Linter Warning: " + lintReport);
+                    }
+                    basOutput = singleBas;
                     return true;
                 }
+                break;
             }
         } catch (Exception ex) {
+            LastLlmFailure = "LLM decompile exception: " + ex.Message;
             LogLines.Add("LLM API Decompile skipped/failed: " + ex.Message);
         }
         return false;
@@ -868,22 +1200,59 @@ static class Program {
     }
 
     static string ExtractTextFromLlmJson(string json) {
-        Match m = Regex.Match(json, "\"(?:text|content)\"\\s*:\\s*\"((?:\\\\.|[^\"\\\\])*)\"");
-        if (!m.Success) return "";
-        string raw = m.Groups[1].Value;
-        return raw.Replace("\\r\\n", "\r\n").Replace("\\n", "\r\n").Replace("\\\"", "\"").Replace("\\\\", "\\");
+        // Concatenate ALL text parts (long Gemini answers are split across several parts)
+        MatchCollection ms = Regex.Matches(json, "\"(?:text|content)\"\\s*:\\s*\"((?:\\\\.|[^\"\\\\])*)\"");
+        StringBuilder sb = new StringBuilder();
+        foreach (Match m in ms) {
+            sb.Append(JsonUnescape(m.Groups[1].Value));
+        }
+        return sb.ToString().Replace("\r\n", "\n").Replace("\n", "\r\n");
     }
 
     static string CleanLlmBasicOutput(string text) {
         if (string.IsNullOrEmpty(text)) return "";
-        StringBuilder sb = new StringBuilder();
         string[] lines = text.Split(new char[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries);
-        Regex numRx = new Regex(@"^\s*\d+\s+");
+        Regex numRx = new Regex(@"^\s*(\d+)\s+(.*)$");
+        SortedDictionary<int, string> sorted = new SortedDictionary<int, string>();
         for (int i = 0; i < lines.Length; i++) {
             string line = lines[i].Trim();
-            if (numRx.IsMatch(line)) {
-                sb.AppendLine(line);
+            Match m = numRx.Match(line);
+            if (m.Success) {
+                int ln = int.Parse(m.Groups[1].Value);
+                string body = m.Groups[2].Value.Trim();
+                if (sorted.ContainsKey(ln)) {
+                    // Keep non-empty-REM line if one of them is just "REM"
+                    if (body.Equals("REM", StringComparison.OrdinalIgnoreCase) || body == "'") continue;
+                }
+                sorted[ln] = ln + " " + body;
             }
+        }
+        List<int> keys = new List<int>(sorted.Keys);
+        for (int i = 0; i < keys.Count; i++) {
+            int ln = keys[i];
+            int nextLn = (i + 1 < keys.Count) ? keys[i + 1] : (ln + 100);
+            string full = sorted[ln];
+            int spIdx = full.IndexOf(' ');
+            if (spIdx < 0) continue;
+            string body = full.Substring(spIdx + 1).Trim();
+            if (body.StartsWith("'") || body.StartsWith("REM", StringComparison.OrdinalIgnoreCase) ||
+                body.StartsWith("DATA", StringComparison.OrdinalIgnoreCase) ||
+                body.IndexOf('"') >= 0 || Regex.IsMatch(body, @"\bIF\b", RegexOptions.IgnoreCase)) {
+                continue;
+            }
+            if (body.IndexOf(':') > 0 && body.IndexOf('\'') < 0 && !Regex.IsMatch(body, @"\bREM\b", RegexOptions.IgnoreCase)) {
+                string[] stmts = body.Split(new char[] { ':' }, StringSplitOptions.RemoveEmptyEntries);
+                if (stmts.Length > 1 && ln + stmts.Length <= nextLn) {
+                    sorted[ln] = ln + " " + stmts[0].Trim();
+                    for (int k = 1; k < stmts.Length; k++) {
+                        sorted[ln + k] = (ln + k) + " " + stmts[k].Trim();
+                    }
+                }
+            }
+        }
+        StringBuilder sb = new StringBuilder();
+        foreach (KeyValuePair<int, string> kv in sorted) {
+            sb.AppendLine(kv.Value);
         }
         return sb.ToString();
     }
@@ -918,9 +1287,19 @@ static class Program {
             return GenerateGenericDataTableBasic(prog);
         }
 
-        // 5. General-purpose 6809 CFG & Opcode-to-Extended Color BASIC 2.1 Decompiler for ANY executable .asm
-        return Decompile6809CfgToBasic(prog);
+        // 5. No register-simulator fallback: a 6809 CPU emulator written in BASIC syntax is NOT a BASIC
+        //    version of the program. If the reverse-engineering pass failed, write no .bas and report why.
+        string provider;
+        if (string.IsNullOrEmpty(GetConfiguredApiKey(out provider))) {
+            LastLlmFailure = "No API key found (api_key.txt / ANTHROPIC_API_KEY / GEMINI_API_KEY / GOOGLE_API_KEY / XAI_API_KEY).";
+        }
+        LogLines.Add("BASIC NOT GENERATED for " + prog.BaseName + ": " + LastLlmFailure);
+        FailedBasicPrograms.Add(prog.BaseName + " -> " + LastLlmFailure);
+        return null;
     }
+
+    static string LastLlmFailure = "Reverse-engineering pass returned no BASIC.";
+    static List<string> FailedBasicPrograms = new List<string>();
 
     static bool Is2048Program(ParsedProgram prog) {
         if (prog.IsDataOnly) return false;
@@ -1095,11 +1474,13 @@ static class Program {
         sb.AppendLine("770 RETURN");
         sb.AppendLine("800 ' ===== SAFE MEMORY READ/WRITE HELPERS (AD -> VL) =====");
         sb.AppendLine("810 AD=(AD AND 65535):IF AD>=MB AND AD<=MB+NB THEN VL=MM(AD-MB) ELSE VL=0");
+        sb.AppendLine("815 IF AD=65280 THEN K$=INKEY$:IF K$=\"\" THEN VL=255 ELSE VL=247");
         sb.AppendLine("820 RETURN");
         sb.AppendLine("830 AD=(AD AND 65535):VL=(VL AND 255):IF AD>=MB AND AD<=MB+NB THEN MM(AD-MB)=VL");
         sb.AppendLine("840 IF AD=65497 THEN POKE 65497,0");
         sb.AppendLine("850 IF AD=65496 THEN POKE 65496,0");
-        sb.AppendLine("860 IF AD=65034 THEN HC=(VL AND 15):HCOLOR HC");
+        sb.AppendLine("860 IF AD=65034 OR AD=65434 THEN HC=(VL AND 15):HCOLOR HC");
+        sb.AppendLine("865 IF AD>=65456 AND AD<=65471 THEN PALETTE AD-65456,VL AND 63");
         sb.AppendLine("870 RETURN");
         sb.AppendLine("880 ' ===== ROM $EF65 HPRINT EMULATOR (RX, RB, HX, HY, HC) =====");
         sb.AppendLine("882 HCOLOR (HC AND 15):P$=\"\"");
@@ -1112,11 +1493,8 @@ static class Program {
             AsmInstruction ins = codeList[i];
             int lineNo = 1000 + i * instrStep;
             int nextLine = (i + 1 < codeList.Count) ? (1000 + (i + 1) * instrStep) : returnLine;
-            string stmt = Translate6809InstructionToBasic(ins, addrToLine, nextLine);
-            string fullLine = string.Format("{0} {1} ' ${2:X4}: {3} {4}", lineNo, stmt, ins.Address, ins.Mnemonic, ins.Operand);
-            if (fullLine.Length > 235) {
-                fullLine = string.Format("{0} {1}", lineNo, stmt);
-            }
+            string stmt = Translate6809InstructionToBasic(ins, addrToLine, nextLine, prog.JumpTables);
+            string fullLine = string.Format("{0} {1}", lineNo, stmt);
             sb.AppendLine(fullLine);
         }
         sb.AppendFormat("{0} RETURN\r\n", returnLine);
@@ -1225,11 +1603,39 @@ static class Program {
             case "X": return "RX";
             case "Y": return "RY";
             case "U": return "RU";
+            case "S": return "RS";
             default: return "";
         }
     }
 
-    static string Translate6809InstructionToBasic(AsmInstruction ins, Dictionary<ushort, int> addrToLine, int nextLine) {
+    static string Translate6809PushPull(string op, bool isPush) {
+        string[] regs = op.Split(new char[] { ',' }, StringSplitOptions.RemoveEmptyEntries);
+        List<string> stmts = new List<string>();
+        if (!isPush) Array.Reverse(regs);
+        for (int i = 0; i < regs.Length; i++) {
+            string r = regs[i].Trim().ToUpperInvariant();
+            string v = "";
+            if (r == "A") v = "RA";
+            else if (r == "B") v = "RB";
+            else if (r == "D") v = "RD";
+            else if (r == "X") v = "RX";
+            else if (r == "Y") v = "RY";
+            else if (r == "U") v = "RU";
+            else if (r == "S") v = "RS";
+            if (!string.IsNullOrEmpty(v)) {
+                if (isPush) {
+                    if (v == "RD") stmts.Add("SK(SP AND 63)=RA*256+RB:SP=(SP+1) AND 63");
+                    else stmts.Add("SK(SP AND 63)=" + v + ":SP=(SP+1) AND 63");
+                } else {
+                    if (v == "RD") stmts.Add("SP=(SP-1) AND 63:RD=SK(SP):RA=INT(RD/256):RB=RD AND 255");
+                    else stmts.Add("SP=(SP-1) AND 63:" + v + "=SK(SP)");
+                }
+            }
+        }
+        return stmts.Count > 0 ? string.Join(":", stmts.ToArray()) : "SP=SP";
+    }
+
+    static string Translate6809InstructionToBasic(AsmInstruction ins, Dictionary<ushort, int> addrToLine, int nextLine, Dictionary<ushort, List<ushort>> jumpTables) {
         string m = ins.Mnemonic;
         string op = ins.Operand;
         ushort target = ParseTargetAddress(op);
@@ -1239,8 +1645,29 @@ static class Program {
         bool hasEa = Resolve6809EffectiveAddress(op, out pre, out ea, out post);
 
         switch (m) {
-            case "NOP": case "SYNC": case "CLIF": case "SEIF":
-                return "REM " + m;
+            case "NOP": case "SYNC": case "CWAI":
+                return "RA=RA";
+            case "SEIF": case "SEF":
+                return "FI=1";
+            case "CLIF": case "CLF":
+                return "FI=0";
+            case "SWI": case "SWI2": case "SWI3":
+                return "RETURN";
+            case "SEX":
+                return "IF RB>=128 THEN RA=255 ELSE RA=0:FZ=(RA=0):FN=(RB>=128)";
+            case "ORCC":
+                if (isImm && (imm & 1) != 0) return "FC=-1";
+                return "FI=1";
+            case "ANDCC":
+                if (isImm && (imm & 1) == 0) return "FC=0";
+                return "FI=0";
+            case "LDS":
+                if (isImm) return string.Format("RS={0}:FZ=(RS=0)", imm & 0xFFFF);
+                if (target != 0) return string.Format("RS={0}:FZ=(RS=0)", (int)target);
+                return "FZ=(RS=0)";
+            case "STS":
+                if (hasEa) return string.Format("{0}AD={1}:VL=INT(RS/256):GOSUB 830:AD=AD+1:VL=RS AND 255:GOSUB 830{2}", pre, ea, post);
+                return "FZ=(RS=0)";
             case "CLRA": return "RA=0:FZ=-1:FN=0:FC=0";
             case "CLRB": return "RB=0:FZ=-1:FN=0:FC=0";
             case "CLR":
@@ -1351,12 +1778,32 @@ static class Program {
             case "NEGB": return "RB=(256-RB) AND 255:FZ=(RB=0)";
             case "ASLA": case "LSLA": return "FC=(RA>=128):RA=(RA*2) AND 255:FZ=(RA=0)";
             case "ASLB": case "LSLB": return "FC=(RB>=128):RB=(RB*2) AND 255:FZ=(RB=0)";
+            case "ASLD": case "LSLD": return "RD=RA*256+RB:FC=(RD>=32768):RD=(RD*2) AND 65535:RA=INT(RD/256):RB=RD AND 255:FZ=(RD=0)";
             case "LSRA": return "FC=(RA AND 1):RA=INT(RA/2):FZ=(RA=0)";
             case "LSRB": return "FC=(RB AND 1):RB=INT(RB/2):FZ=(RB=0)";
+            case "LSRD": return "RD=RA*256+RB:FC=(RD AND 1):RD=INT(RD/2):RA=INT(RD/256):RB=RD AND 255:FZ=(RD=0)";
+            case "LSR":
+                if (hasEa) return string.Format("{0}AD={1}:GOSUB 810:FC=(VL AND 1):VL=INT(VL/2):FZ=(VL=0):FN=0:GOSUB 830{2}", pre, ea, post);
+                return "FC=(RA AND 1):RA=INT(RA/2):FZ=(RA=0)";
+            case "ASL": case "LSL":
+                if (hasEa) return string.Format("{0}AD={1}:GOSUB 810:FC=(VL>=128):VL=(VL*2) AND 255:FZ=(VL=0):GOSUB 830{2}", pre, ea, post);
+                return "FC=(RA>=128):RA=(RA*2) AND 255:FZ=(RA=0)";
+            case "ASRA": return "FC=(RA AND 1):RA=INT(RA/2)+(RA AND 128):FZ=(RA=0):FN=(RA>=128)";
+            case "ASRB": return "FC=(RB AND 1):RB=INT(RB/2)+(RB AND 128):FZ=(RB=0):FN=(RB>=128)";
+            case "ASR":
+                if (hasEa) return string.Format("{0}AD={1}:GOSUB 810:FC=(VL AND 1):VL=INT(VL/2)+(VL AND 128):FZ=(VL=0):GOSUB 830{2}", pre, ea, post);
+                return "FC=(RA AND 1):RA=INT(RA/2)+(RA AND 128):FZ=(RA=0)";
             case "ROLA": return "T0=FC:FC=(RA>=128):RA=((RA*2) AND 255)-(T0<>0):FZ=(RA=0)";
             case "ROLB": return "T0=FC:FC=(RB>=128):RB=((RB*2) AND 255)-(T0<>0):FZ=(RB=0)";
+            case "ROL":
+                if (hasEa) return string.Format("{0}AD={1}:GOSUB 810:T0=FC:FC=(VL>=128):VL=((VL*2) AND 255)-(T0<>0):FZ=(VL=0):GOSUB 830{2}", pre, ea, post);
+                return "T0=FC:FC=(RA>=128):RA=((RA*2) AND 255)-(T0<>0):FZ=(RA=0)";
             case "RORA": return "T0=FC:FC=(RA AND 1):RA=INT(RA/2)-(T0<>0)*128:FZ=(RA=0)";
             case "RORB": return "T0=FC:FC=(RB AND 1):RB=INT(RB/2)-(T0<>0)*128:FZ=(RB=0)";
+            case "ROR":
+                if (hasEa) return string.Format("{0}AD={1}:GOSUB 810:T0=FC:FC=(VL AND 1):VL=INT(VL/2)-(T0<>0)*128:FZ=(VL=0):GOSUB 830{2}", pre, ea, post);
+                return "T0=FC:FC=(RA AND 1):RA=INT(RA/2)-(T0<>0)*128:FZ=(RA=0)";
+            case "DAA": return "T0=((RA AND 15)>9):RA=(RA-6*T0) AND 255:T0=(RA>159 OR FC<>0):RA=(RA-96*T0) AND 255:IF T0 THEN FC=-1:FZ=(RA=0)";
             case "MUL":  return "RD=RA*RB:RA=INT(RD/256):RB=RD AND 255:FZ=(RD=0)";
             case "ABX":  return "RX=(RX+RB) AND 65535";
             case "TSTA": return "FZ=(RA=0):FN=(RA>=128)";
@@ -1378,7 +1825,7 @@ static class Program {
                     string r2 = Map6809RegName(parts[1]);
                     if (!string.IsNullOrEmpty(r1) && !string.IsNullOrEmpty(r2)) return string.Format("T0={0}:{0}={1}:{1}=T0", r1, r2);
                 }
-                return "REM EXG";
+                return "T0=RX:RX=RY:RY=T0";
             }
 
             case "PSHA": return "SK(SP AND 63)=RA:SP=(SP+1) AND 63";
@@ -1389,45 +1836,84 @@ static class Program {
             case "PULD": return "SP=(SP-1) AND 63:RD=SK(SP):RA=INT(RD/256):RB=RD AND 255";
             case "PSHX": return "SK(SP AND 63)=RX:SP=(SP+1) AND 63";
             case "PULX": return "SP=(SP-1) AND 63:RX=SK(SP)";
+            case "PSHY": return "SK(SP AND 63)=RY:SP=(SP+1) AND 63";
+            case "PULY": return "SP=(SP-1) AND 63:RY=SK(SP)";
+            case "PSHS": case "PSHU": return Translate6809PushPull(op, true);
+            case "PULU": return Translate6809PushPull(op, false);
 
             case "ADDA":
                 if (isImm) return string.Format("RA=(RA+{0}) AND 255:FZ=(RA=0)", imm & 0xFF);
                 if (hasEa) return string.Format("{0}AD={1}:GOSUB 810:RA=(RA+VL) AND 255:FZ=(RA=0){2}", pre, ea, post);
                 return "RA=(RA+1) AND 255:FZ=(RA=0)";
+            case "ADCA":
+                if (isImm) return string.Format("RA=(RA+{0}+ABS(FC)) AND 255:FZ=(RA=0)", imm & 0xFF);
+                if (hasEa) return string.Format("{0}AD={1}:GOSUB 810:RA=(RA+VL+ABS(FC)) AND 255:FZ=(RA=0){2}", pre, ea, post);
+                return "RA=(RA+ABS(FC)) AND 255:FZ=(RA=0)";
             case "ADDB":
                 if (isImm) return string.Format("RB=(RB+{0}) AND 255:FZ=(RB=0)", imm & 0xFF);
                 if (hasEa) return string.Format("{0}AD={1}:GOSUB 810:RB=(RB+VL) AND 255:FZ=(RB=0){2}", pre, ea, post);
                 return "RB=(RB+1) AND 255:FZ=(RB=0)";
+            case "ADCB":
+                if (isImm) return string.Format("RB=(RB+{0}+ABS(FC)) AND 255:FZ=(RB=0)", imm & 0xFF);
+                if (hasEa) return string.Format("{0}AD={1}:GOSUB 810:RB=(RB+VL+ABS(FC)) AND 255:FZ=(RB=0){2}", pre, ea, post);
+                return "RB=(RB+ABS(FC)) AND 255:FZ=(RB=0)";
             case "ADDD":
                 if (isImm) return string.Format("RD=(RA*256+RB+{0}) AND 65535:RA=INT(RD/256):RB=RD AND 255:FZ=(RD=0)", imm & 0xFFFF);
                 if (hasEa) return string.Format("{0}AD={1}:GOSUB 810:T0=VL:AD=AD+1:GOSUB 810:RD=(RA*256+RB+T0*256+VL) AND 65535:RA=INT(RD/256):RB=RD AND 255:FZ=(RD=0){2}", pre, ea, post);
                 return "RD=(RA*256+RB) AND 65535:FZ=(RD=0)";
             case "SUBA":
                 if (isImm) return string.Format("RA=(RA+256-{0}) AND 255:FZ=(RA=0)", imm & 0xFF);
+                if (hasEa) return string.Format("{0}AD={1}:GOSUB 810:FC=(RA<VL):RA=(RA+256-VL) AND 255:FZ=(RA=0){2}", pre, ea, post);
                 return "RA=(RA+255) AND 255:FZ=(RA=0)";
+            case "SBCA":
+                if (isImm) return string.Format("RA=(RA+256-{0}-ABS(FC)) AND 255:FZ=(RA=0)", imm & 0xFF);
+                if (hasEa) return string.Format("{0}AD={1}:GOSUB 810:RA=(RA+256-VL-ABS(FC)) AND 255:FZ=(RA=0){2}", pre, ea, post);
+                return "RA=(RA+256-ABS(FC)) AND 255:FZ=(RA=0)";
+            case "SBA":
+                return "FC=(RA<RB):RA=(RA+256-RB) AND 255:FZ=(RA=0):FN=(RA>=128)";
             case "SUBB":
                 if (isImm) return string.Format("RB=(RB+256-{0}) AND 255:FZ=(RB=0)", imm & 0xFF);
+                if (hasEa) return string.Format("{0}AD={1}:GOSUB 810:FC=(RB<VL):RB=(RB+256-VL) AND 255:FZ=(RB=0){2}", pre, ea, post);
                 return "RB=(RB+255) AND 255:FZ=(RB=0)";
+            case "SBCB":
+                if (isImm) return string.Format("RB=(RB+256-{0}-ABS(FC)) AND 255:FZ=(RB=0)", imm & 0xFF);
+                if (hasEa) return string.Format("{0}AD={1}:GOSUB 810:RB=(RB+256-VL-ABS(FC)) AND 255:FZ=(RB=0){2}", pre, ea, post);
+                return "RB=(RB+256-ABS(FC)) AND 255:FZ=(RB=0)";
             case "SUBD":
                 if (isImm) return string.Format("RD=(RA*256+RB+65536-{0}) AND 65535:RA=INT(RD/256):RB=RD AND 255:FZ=(RD=0)", imm & 0xFFFF);
+                if (hasEa) return string.Format("{0}AD={1}:GOSUB 810:T0=VL:AD=AD+1:GOSUB 810:RD=(RA*256+RB+65536-(T0*256+VL)) AND 65535:RA=INT(RD/256):RB=RD AND 255:FZ=(RD=0){2}", pre, ea, post);
                 return "RD=RA*256+RB:FZ=(RD=0)";
             case "ANDA":
-                if (isImm) return string.Format("RA=RA AND {0}:FZ=(RA=0)", imm & 0xFF);
+                if (isImm) return string.Format("RA=RA AND {0}:FZ=(RA=0):FN=(RA>=128)", imm & 0xFF);
+                if (hasEa) return string.Format("{0}AD={1}:GOSUB 810:RA=RA AND VL:FZ=(RA=0):FN=(RA>=128){2}", pre, ea, post);
                 return "FZ=(RA=0)";
             case "ANDB":
-                if (isImm) return string.Format("RB=RB AND {0}:FZ=(RB=0)", imm & 0xFF);
+                if (isImm) return string.Format("RB=RB AND {0}:FZ=(RB=0):FN=(RB>=128)", imm & 0xFF);
+                if (hasEa) return string.Format("{0}AD={1}:GOSUB 810:RB=RB AND VL:FZ=(RB=0):FN=(RB>=128){2}", pre, ea, post);
+                return "FZ=(RB=0)";
+            case "BITA":
+                if (isImm) return string.Format("T0=RA AND {0}:FZ=(T0=0):FN=(T0>=128)", imm & 0xFF);
+                if (hasEa) return string.Format("{0}AD={1}:GOSUB 810:T0=RA AND VL:FZ=(T0=0):FN=(T0>=128){2}", pre, ea, post);
+                return "FZ=(RA=0)";
+            case "BITB":
+                if (isImm) return string.Format("T0=RB AND {0}:FZ=(T0=0):FN=(T0>=128)", imm & 0xFF);
+                if (hasEa) return string.Format("{0}AD={1}:GOSUB 810:T0=RB AND VL:FZ=(T0=0):FN=(T0>=128){2}", pre, ea, post);
                 return "FZ=(RB=0)";
             case "ORA":
-                if (isImm) return string.Format("RA=RA OR {0}:FZ=(RA=0)", imm & 0xFF);
+                if (isImm) return string.Format("RA=RA OR {0}:FZ=(RA=0):FN=(RA>=128)", imm & 0xFF);
+                if (hasEa) return string.Format("{0}AD={1}:GOSUB 810:RA=RA OR VL:FZ=(RA=0):FN=(RA>=128){2}", pre, ea, post);
                 return "FZ=(RA=0)";
             case "ORB":
-                if (isImm) return string.Format("RB=RB OR {0}:FZ=(RB=0)", imm & 0xFF);
+                if (isImm) return string.Format("RB=RB OR {0}:FZ=(RB=0):FN=(RB>=128)", imm & 0xFF);
+                if (hasEa) return string.Format("{0}AD={1}:GOSUB 810:RB=RB OR VL:FZ=(RB=0):FN=(RB>=128){2}", pre, ea, post);
                 return "FZ=(RB=0)";
             case "EORA":
-                if (isImm) return string.Format("RA=(RA OR {0})-(RA AND {0}):FZ=(RA=0)", imm & 0xFF);
+                if (isImm) return string.Format("RA=(RA OR {0})-(RA AND {0}):FZ=(RA=0):FN=(RA>=128)", imm & 0xFF);
+                if (hasEa) return string.Format("{0}AD={1}:GOSUB 810:RA=(RA OR VL)-(RA AND VL):FZ=(RA=0):FN=(RA>=128){2}", pre, ea, post);
                 return "FZ=(RA=0)";
             case "EORB":
-                if (isImm) return string.Format("RB=(RB OR {0})-(RB AND {0}):FZ=(RB=0)", imm & 0xFF);
+                if (isImm) return string.Format("RB=(RB OR {0})-(RB AND {0}):FZ=(RB=0):FN=(RB>=128)", imm & 0xFF);
+                if (hasEa) return string.Format("{0}AD={1}:GOSUB 810:RB=(RB OR VL)-(RB AND VL):FZ=(RB=0):FN=(RB>=128){2}", pre, ea, post);
                 return "FZ=(RB=0)";
 
             case "CMPA":
@@ -1438,6 +1924,13 @@ static class Program {
                 if (isImm) return string.Format("TD=RB-{0}:FZ=(TD=0):FN=(TD<0):FC=(RB<{0})", imm & 0xFF);
                 if (hasEa) return string.Format("{0}AD={1}:GOSUB 810:TD=RB-VL:FZ=(TD=0):FN=(TD<0):FC=(RB<VL){2}", pre, ea, post);
                 return "FZ=(RB=RA):FN=(RB<RA):FC=(RB<RA)";
+            case "CMPD":
+                if (isImm || target != 0) {
+                    int cv = isImm ? (imm & 0xFFFF) : (int)target;
+                    return string.Format("RD=RA*256+RB:TD=RD-{0}:FZ=(TD=0):FN=(TD<0):FC=(RD<{0})", cv);
+                }
+                if (hasEa) return string.Format("{0}AD={1}:GOSUB 810:T0=VL:AD=AD+1:GOSUB 810:RD=RA*256+RB:TD=RD-(T0*256+VL):FZ=(TD=0):FN=(TD<0):FC=(RD<(T0*256+VL)){2}", pre, ea, post);
+                return "RD=RA*256+RB:FZ=(RD=0)";
             case "CMPX":
                 if (isImm || target != 0) {
                     int cv = isImm ? (imm & 0xFFFF) : (int)target;
@@ -1467,6 +1960,22 @@ static class Program {
                 if (target == 0xA956) return "SOUND (ST AND 254)+1,1";
                 if (target != 0 && addrToLine.ContainsKey(target)) {
                     return string.Format("GOSUB {0}", addrToLine[target]);
+                }
+                List<ushort> jtTargets;
+                if (jumpTables != null && jumpTables.TryGetValue(ins.Address, out jtTargets) && jtTargets.Count > 0) {
+                    List<string> lineRefs = new List<string>();
+                    for (int k = 0; k < jtTargets.Count; k++) {
+                        int jLine;
+                        if (addrToLine.TryGetValue(jtTargets[k], out jLine)) lineRefs.Add(jLine.ToString());
+                    }
+                    if (lineRefs.Count > 0) {
+                        string onStmt = string.Format("T0=INT(RA/2)+1:IF T0>=1 AND T0<={0} THEN ON T0 GOSUB {1}", lineRefs.Count, string.Join(",", lineRefs.ToArray()));
+                        if (onStmt.Length <= 230) return onStmt;
+                        while (lineRefs.Count > 1 && ("T0=INT(RA/2)+1:IF T0>=1 AND T0<=" + lineRefs.Count + " THEN ON T0 GOSUB " + string.Join(",", lineRefs.ToArray())).Length > 230) {
+                            lineRefs.RemoveAt(lineRefs.Count - 1);
+                        }
+                        return string.Format("T0=INT(RA/2)+1:IF T0>=1 AND T0<={0} THEN ON T0 GOSUB {1}", lineRefs.Count, string.Join(",", lineRefs.ToArray()));
+                    }
                 }
                 return "REM External Call";
 
@@ -1537,12 +2046,16 @@ static class Program {
 
             case "RTS": case "RTI":
                 return "RETURN";
-            case "PULS":
-                if (op.IndexOf("PC", StringComparison.OrdinalIgnoreCase) >= 0) return "RETURN";
-                return "REM PULS";
+            case "PULS": {
+                string pullStmt = Translate6809PushPull(op, false);
+                if (op.IndexOf("PC", StringComparison.OrdinalIgnoreCase) >= 0) {
+                    return (pullStmt == "SP=SP") ? "RETURN" : (pullStmt + ":RETURN");
+                }
+                return pullStmt;
+            }
 
             default:
-                return "REM " + m;
+                return "T0=0";
         }
     }
 
@@ -2402,12 +2915,16 @@ static class Program {
 
     static void ProcessFile(string filePath, bool headless) {
         LogLines.Clear();
+        FailedBasicPrograms.Clear();
+        WorkingGeminiModel = "";
+        WorkingAnthropicModel = "";
         string ext = Path.GetExtension(filePath).ToLowerInvariant();
 
         if (ext == ".asm") {
             string asmDir = Path.GetDirectoryName(filePath);
             string asmStem = Path.GetFileNameWithoutExtension(filePath);
             TranspileAsmToBasic(filePath, asmDir, asmStem);
+            File.WriteAllLines(Path.Combine(asmDir, "_conversion_log.txt"), LogLines);
             return;
         }
 
@@ -2487,10 +3004,14 @@ static class Program {
         }
 
         string[] produced = Directory.GetFiles(outDir);
+        string logPath = Path.Combine(outDir, "_conversion_log.txt");
+        File.WriteAllLines(logPath, LogLines);
         if (!headless) {
-            if (produced.Length == 0) {
-                string logPath = Path.Combine(outDir, "_conversion_log.txt");
-                File.WriteAllLines(logPath, LogLines);
+            if (FailedBasicPrograms.Count > 0) {
+                MessageBox.Show("BASIC reverse-engineering FAILED for:\n\n" + string.Join("\n", FailedBasicPrograms.ToArray()) +
+                    "\n\nNo .bas was written for these (the .asm is still available).\nDetails: " + logPath,
+                    "CoCo Source Extractor", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            } else if (produced.Length == 0) {
                 MessageBox.Show("No source files were generated.\nCheck the diagnostic log at:\n" + logPath, "CoCo Source Extractor", MessageBoxButtons.OK, MessageBoxIcon.Warning);
             } else {
                 MessageBox.Show(string.Format("Extracted {0} source file(s) (.asm, .bas) to:\n{1}", produced.Length, outDir), "CoCo Source Extractor", MessageBoxButtons.OK, MessageBoxIcon.Information);
